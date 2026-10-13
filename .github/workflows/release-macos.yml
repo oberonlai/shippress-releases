@@ -1,0 +1,316 @@
+# Builds the macOS app as one .dmg per Mac CPU (Apple Silicon, Intel). See docs/RELEASE-MAC.md.
+# One build per CPU (#68): the universal .dmg was 488 MB, mostly because it carried both CPUs' app binary, PHP and Node.
+# Each build bundles only its own CPU's PHP and Node.js (runtime/php/<arch>, runtime/node/<arch>: the same folders
+# src-tauri/src/resources.rs looks up, so either build finds its own). cloudflared is not bundled: "Share to phone"
+# downloads it on first use (src-tauri/src/share.rs `tool`, sha256 pinned there).
+# - Tag push `vX.Y.Z`: creates/updates the GitHub Release with ShipPress_X.Y.Z_aarch64.dmg, ShipPress_X.Y.Z_x64.dmg and
+#   the stable names ShipPress-mac-arm64.dmg, ShipPress-mac-intel.dmg and ShipPress-mac-universal.dmg (a copy of the
+#   arm64 one, so the old .../releases/latest/download/ShipPress-mac-universal.dmg link keeps working).
+# - Manual run (workflow_dispatch): build only, the files are uploaded as a workflow artifact (no release).
+# Bundling is enabled for macOS only by src-tauri/tauri.macos.conf.json (Linux CI / dev / e2e keep bundle off).
+# No Apple secrets are needed: without them the app is ad-hoc signed ("-" in tauri.macos.conf.json).
+# Auto-updates: with the TAURI_SIGNING_PRIVATE_KEY(+_PASSWORD) secrets each build also makes its signed update
+# ShipPress_aarch64.app.tar.gz / ShipPress_x64.app.tar.gz (+ .sig), and the last job writes one latest.json with
+# darwin-aarch64 and darwin-x86_64 (docs/RELEASE-MAC.md "Updates"); without them it still builds the .dmg files and
+# skips those with a warning.
+name: Release macOS
+
+# macOS runners bill 10x: this runs only on a v* tag push (#76). workflow_dispatch stays for emergencies but is frozen
+# until 2026-11-01 (cc-runs/rules.md); no tag without the user's OK.
+# Runs in the PUBLIC shippress-releases repo; source is checked out read-only from the private repo at the same tag.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dmg:
+    name: .dmg (${{ matrix.arch }})
+    # Apple Silicon runner for both: the Intel app is cross-compiled, and its binaries are run under Rosetta when the
+    # runner has it (else checked by sha256 / lipo only, with a warning).
+    runs-on: macos-14
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: aarch64         # resources.rs folder name (std::env::consts::ARCH)
+            target: aarch64-apple-darwin
+            dmg_arch: aarch64     # ShipPress_X.Y.Z_aarch64.dmg, ShipPress_aarch64.app.tar.gz
+            lipo: arm64
+            stable: ShipPress-mac-arm64.dmg
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            dmg_arch: x64
+            lipo: x86_64
+            stable: ShipPress-mac-intel.dmg
+    env:
+      CARGO_TERM_COLOR: always
+      # tauri.macos.conf.json's beforeBuildCommand re-stages: same CPU only (scripts/stage-resources.mjs).
+      STAGE_ARCH: ${{ matrix.arch }}
+      ARCH: ${{ matrix.arch }}
+      LIPO: ${{ matrix.lipo }}
+      STABLE_DMG: ${{ matrix.stable }}
+      UPDATE_TGZ: ShipPress_${{ matrix.dmg_arch }}.app.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: oberonlai/shippress
+          ref: ${{ github.ref_name }}
+          token: ${{ secrets.SHIPPRESS_SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+      - run: npm ci
+
+      - name: Version
+        id: version
+        run: |
+          v=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match tauri.conf.json version $v (bump it first, see docs/RELEASE-MAC.md)"; exit 1
+          fi
+
+      # Can this runner run the Intel binaries (Rosetta)? The arm64 ones always run.
+      - name: Can run this CPU's binaries
+        id: runs
+        run: |
+          if [ "$ARCH" = aarch64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "ok=false" >> "$GITHUB_OUTPUT"; echo "::warning::no Rosetta on this runner; the $ARCH binaries are checked by sha256 and lipo only"; fi
+
+      # Everything the app runs from its resources (see docs/RELEASE-MAC.md): WP-CLI, the SQLite drop-in and PHP for this
+      # CPU. Downloaded here, never committed; every file is checked before it is used. WordPress itself is not bundled
+      # (#74): the app downloads it for the first new site (src-tauri/src/wordpress.rs); the self-contained check below
+      # downloads it the same way (sha1 checked) and passes it as AIWP_WP_ZIP, like the app does.
+      - name: Bundled runtime (wp-cli.phar sha512, sqlite.zip sha256)
+        env:
+          SQLITE_URL: https://downloads.wordpress.org/plugin/sqlite-database-integration.3.0.2.zip
+          SQLITE_SHA256: 1602e75577ad9b3a7e3e4a6a44a81b9541cdee2124d48928faf61c6fd3cd4f74
+        run: |
+          mkdir -p runtime
+          WPCLI=https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+          curl -fsSL "$WPCLI" -o runtime/wp-cli.phar.tmp
+          want=$(curl -fsSL "$WPCLI.sha512" | awk '{print $1}')
+          got=$(shasum -a 512 runtime/wp-cli.phar.tmp | awk '{print $1}')
+          if [ -z "$want" ] || [ "$want" != "$got" ]; then rm -f runtime/wp-cli.phar.tmp; echo "::error::wp-cli.phar sha512 mismatch"; exit 1; fi
+          mv runtime/wp-cli.phar.tmp runtime/wp-cli.phar
+          echo "$got" > runtime/wp-cli.phar.sha512
+          rm -f runtime/wp.zip
+          # SQLite database integration: pinned (it is the site's database layer).
+          curl -fsSL "$SQLITE_URL" -o runtime/sqlite.zip
+          echo "$SQLITE_SHA256  runtime/sqlite.zip" | shasum -a 256 -c -
+
+      # Static PHP CLI build (static-php-cli "common" set: pdo_sqlite, sqlite3, zip, gd, curl, mbstring, openssl, ...)
+      # for this CPU only, pinned by version and sha256. The app picks runtime/php/<arch>/php by its CPU (resources.rs).
+      - name: Bundled PHP (this CPU, sha256 pinned)
+        env:
+          PHP_VERSION: 8.4.23
+          PHP_SHA256_AARCH64: bba286e442796dbd420d778a016e2817b31d5036d11b3ba316d19a60de912cdc
+          PHP_SHA256_X86_64: bd1c20f355e73a9f807b24ba62fd98f3a57bc08d063ebb3aa6393909e01ce89e
+          RUNS: ${{ steps.runs.outputs.ok }}
+        run: |
+          case "$ARCH" in aarch64) sum=$PHP_SHA256_AARCH64 ;; x86_64) sum=$PHP_SHA256_X86_64 ;; esac
+          tgz="php-$PHP_VERSION-cli-macos-$ARCH.tar.gz"
+          curl -fsSL "https://dl.static-php.dev/static-php-cli/common/$tgz" -o "$RUNNER_TEMP/$tgz"
+          echo "$sum  $RUNNER_TEMP/$tgz" | shasum -a 256 -c -
+          mkdir -p "runtime/php/$ARCH"
+          tar -xzf "$RUNNER_TEMP/$tgz" -C "runtime/php/$ARCH" php
+          chmod 755 "runtime/php/$ARCH/php"
+          codesign --force --sign - "runtime/php/$ARCH/php"   # ad-hoc, like the app (Apple Silicon only runs signed code)
+          [ "$(lipo -archs "runtime/php/$ARCH/php")" = "$LIPO" ]
+          if [ "$RUNS" = true ]; then
+            # WordPress on SQLite needs these.
+            mods=$("runtime/php/$ARCH/php" -m)
+            for m in pdo_sqlite sqlite3 zip mbstring openssl curl gd Phar; do echo "$mods" | grep -qx "$m" || { echo "::error::bundled PHP lacks $m"; exit 1; }; done
+            "runtime/php/$ARCH/php" runtime/wp-cli.phar --version
+          fi
+
+      # Official Node.js LTS for this CPU (MCP server, templates, `npx` for hosts/connectors), so a Mac without Node
+      # installed works. Pinned version; the tarball is checked against nodejs.org's SHASUMS256.txt and the sha256 pinned
+      # in the script, which also leaves out what nothing runs (headers, docs, man pages, corepack). Node's own
+      # Developer ID signature is kept (not re-signed).
+      - name: Bundled Node.js (this CPU, SHASUMS256 checked)
+        env:
+          RUNS: ${{ steps.runs.outputs.ok }}
+        run: |
+          node scripts/fetch-node.mjs --arch "$ARCH"
+          [ "$(lipo -archs "runtime/node/$ARCH/bin/node")" = "$LIPO" ]
+          codesign --verify --strict "runtime/node/$ARCH/bin/node"
+          if [ "$RUNS" = true ]; then PATH="$PWD/runtime/node/$ARCH/bin:/usr/bin:/bin" sh -c 'node --version && npm --version && npx --version'; fi
+
+      - name: Stage app resources (bundle-resources/)
+        run: node scripts/stage-resources.mjs --arch "$ARCH" --require-php --require-node
+
+      - name: Build (tauri build, ${{ matrix.target }})
+        env:
+          # Signing / notarization hooks, unused until there is an Apple Developer account (not purchased).
+          # To enable: add these repository secrets and uncomment. tauri picks them up from the environment;
+          # APPLE_SIGNING_IDENTITY overrides the ad-hoc "-" identity in tauri.macos.conf.json.
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}                    # base64 .p12 (Developer ID Application)
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}          # "Developer ID Application: … (TEAMID)"
+          # APPLE_ID: ${{ secrets.APPLE_ID }}                                      # notarization
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}                          # app-specific password
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CI: true
+          TARGET: ${{ matrix.target }}
+          # Signs the update archive (createUpdaterArtifacts in tauri.macos.conf.json). Never echoed.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            npx tauri build --target "$TARGET" --bundles app,dmg
+          else
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: building without the auto-update files (installed apps won't see this version)"
+            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+            npx tauri build --target "$TARGET" --bundles app,dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          fi
+
+      - name: Check the app is self-contained (this CPU only)
+        env:
+          TARGET: ${{ matrix.target }}
+          RUNS: ${{ steps.runs.outputs.ok }}
+        run: |
+          R="src-tauri/target/$TARGET/release/bundle/macos/ShipPress.app/Contents/Resources"
+          for f in mcp-server/server.mjs mcp-server/lib.mjs scripts/site-setup.sh scripts/preview-router.php scripts/share-router.php templates/aiwp-starter/style.css \
+                   config/wpcli-policy.json themes/index.json runtime/wp-cli.phar runtime/sqlite.zip "runtime/php/$ARCH/php" \
+                   "runtime/node/$ARCH/bin/node" "runtime/node/$ARCH/bin/npx" "runtime/node/$ARCH/lib/node_modules/npm/bin/npx-cli.js"; do
+            [ -s "$R/$f" ] || { echo "::error::missing from the app: $f"; exit 1; }
+          done
+          [ -x "$R/scripts/site-setup.sh" ] && [ -x "$R/runtime/php/$ARCH/php" ]
+          for b in node npm npx; do [ -x "$R/runtime/node/$ARCH/bin/$b" ] || { echo "::error::$ARCH/bin/$b not executable"; exit 1; }; done
+          # Only this CPU's runtimes, no cloudflared (downloaded on first Share to phone), no tests, no npm docs.
+          for d in runtime/php runtime/node; do [ "$(ls "$R/$d")" = "$ARCH" ] || { echo "::error::$d holds $(ls "$R/$d" | tr '\n' ' ')"; exit 1; }; done
+          [ ! -e "$R/runtime/cloudflared" ] || { echo "::error::cloudflared is bundled"; exit 1; }
+          [ ! -e "$R/runtime/wp.zip" ] || { echo "::error::wp.zip is bundled (the app downloads WordPress)"; exit 1; }
+          [ ! -e "$R/themes/ma-vertical" ] || { echo "::error::theme screenshots are bundled"; exit 1; }
+          [ ! -e "$R/runtime/node/$ARCH/lib/node_modules/npm/docs" ] || { echo "::error::npm docs bundled"; exit 1; }
+          if ls "$R"/mcp-server/*.test.mjs >/dev/null 2>&1; then echo "::error::tests bundled"; exit 1; fi
+          [ "$(lipo -archs "$R/../MacOS/ai-wp-builder")" = "$LIPO" ]
+          du -sh "$R/../.." "$R/../MacOS/ai-wp-builder" "$R/runtime/php" "$R/runtime/node"
+          if [ "$RUNS" != true ]; then echo "::warning::not running the $ARCH app's tools on this runner"; exit 0; fi
+          # A clean Mac: no php or node on PATH (/usr/bin has neither). The bundled ones only, as the app passes them.
+          if PATH=/usr/bin:/bin command -v node >/dev/null; then echo "::error::node on the clean PATH, the check below proves nothing"; exit 1; fi
+          NODE="$R/runtime/node/$ARCH/bin/node"
+          # A new site from a gallery template (site-setup.sh runs apply-template.mjs with AIWP_NODE), with WordPress
+          # downloaded and sha1-checked the way the app does it (wordpress.rs) and passed as AIWP_WP_ZIP.
+          wpzip="$RUNNER_TEMP/latest.zip"
+          curl -fsSL https://wordpress.org/latest.zip -o "$wpzip"
+          want=$(curl -fsSL https://wordpress.org/latest.zip.sha1 | awk '{print $1}')
+          [ -n "$want" ] && [ "$want" = "$(shasum -a 1 "$wpzip" | awk '{print $1}')" ] || { echo "::error::latest.zip sha1 mismatch"; exit 1; }
+          site="$RUNNER_TEMP/self-contained-site"
+          PATH=/usr/bin:/bin AIWP_WP_ZIP="$wpzip" AIWP_PHP="$R/runtime/php/$ARCH/php" AIWP_NODE="$NODE" bash "$R/scripts/site-setup.sh" "$site" 8765 "Self-contained" persona | grep -qx READY
+          [ -f "$site/.aiwp/template.json" ] || { echo "::error::the template was not applied"; exit 1; }
+          # The AI's WordPress tools (the MCP server the engines start with the bundled node) answer.
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | PATH=/usr/bin:/bin AIWP_SITE="$site" "$NODE" "$R/mcp-server/server.mjs" | grep -q '"wp_cli"'
+          # npx for the hosts' and connectors' npm tools, from the bundled bin/ first on PATH (resources::put_node_on_path).
+          PATH="$R/runtime/node/$ARCH/bin:/usr/bin:/bin" npx --version
+          rm -rf "$site"
+
+      - name: Collect .dmg (+ update archive)
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSIONED: ShipPress_${{ steps.version.outputs.version }}_${{ matrix.dmg_arch }}.dmg
+        run: |
+          src=$(ls "src-tauri/target/$TARGET/release/bundle/dmg/"*.dmg | head -n 1)
+          [ -f "$src" ] || { echo "::error::no .dmg was built"; exit 1; }
+          mkdir -p out
+          cp "$src" "out/$VERSIONED"
+          cp "$src" "out/$STABLE_DMG"
+          ls -l out/
+          # Auto-update files (only when the build was signed for updates): the archive + its signature, renamed per CPU.
+          upd="src-tauri/target/$TARGET/release/bundle/macos/ShipPress.app.tar.gz"
+          if [ -f "$upd" ] && [ -f "$upd.sig" ]; then
+            cp "$upd" "out/$UPDATE_TGZ"
+            cp "$upd.sig" "out/$UPDATE_TGZ.sig"
+          else
+            echo "::warning::no signed update archive for $ARCH: the release has no auto-update files"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Both CPUs' files together: the universal-name copy, one latest.json for both CPUs, SHA256SUMS.txt, then the release.
+  release:
+    name: Release files
+    needs: dmg
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: oberonlai/shippress
+          ref: ${{ github.ref_name }}
+          token: ${{ secrets.SHIPPRESS_SOURCE_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mac-*
+          path: out
+          merge-multiple: true
+
+      - name: Collect files
+        id: files
+        run: |
+          v=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          cd out
+          [ -f ShipPress-mac-arm64.dmg ] && [ -f ShipPress-mac-intel.dmg ] || { echo "::error::a .dmg is missing"; exit 1; }
+          # The old stable link (.../latest/download/ShipPress-mac-universal.dmg, landing page, 0.1.x docs) keeps working:
+          # Apple Silicon is what new Macs are.
+          cp ShipPress-mac-arm64.dmg ShipPress-mac-universal.dmg
+          files=("ShipPress_${v}_aarch64.dmg" "ShipPress_${v}_x64.dmg" ShipPress-mac-arm64.dmg ShipPress-mac-intel.dmg ShipPress-mac-universal.dmg)
+          for f in "${files[@]}"; do [ -s "$f" ] || { echo "::error::missing $f"; exit 1; }; done
+          # Auto-update files: both CPUs or none (one latest.json lists both; half of it would strand one kind of Mac).
+          if [ -f ShipPress_aarch64.app.tar.gz.sig ] && [ -f ShipPress_x64.app.tar.gz.sig ]; then
+            node ../scripts/updater-manifest.mjs --version "$v" --sig-aarch64 ShipPress_aarch64.app.tar.gz.sig --sig-x86_64 ShipPress_x64.app.tar.gz.sig --out latest.json
+            files+=(ShipPress_aarch64.app.tar.gz ShipPress_aarch64.app.tar.gz.sig ShipPress_x64.app.tar.gz ShipPress_x64.app.tar.gz.sig latest.json)
+          elif ls ./*.app.tar.gz.sig >/dev/null 2>&1; then
+            echo "::error::only one CPU's build has update files"; exit 1
+          else
+            echo "::warning::no signed update archives: the release has no auto-update files"
+          fi
+          shasum -a 256 "${files[@]}" > SHA256SUMS.txt && cat SHA256SUMS.txt
+          printf '%s\n' "${files[@]/#/out/}" out/SHA256SUMS.txt > upload.txt
+          ls -l
+
+      - name: Upload artifact (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShipPress-mac
+          path: |
+            out/
+            !out/upload.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag)
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "ShipPress $TAG" --notes "ShipPress $TAG for Mac (Apple Silicon: ShipPress-mac-arm64.dmg, Intel: ShipPress-mac-intel.dmg)." --verify-tag
+          # The .dmg files and SHA256SUMS.txt, plus the auto-update files when the builds made them (out/upload.txt).
+          files=(); while IFS= read -r f; do files+=("$f"); done < out/upload.txt
+          gh release upload "$TAG" "${files[@]}" --clobber
