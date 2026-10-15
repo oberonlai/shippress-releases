@@ -202,8 +202,8 @@ jobs:
           [ ! -e "$R/themes/ma-vertical" ] || { echo "::error::theme screenshots are bundled"; exit 1; }
           [ ! -e "$R/runtime/node/$ARCH/lib/node_modules/npm/docs" ] || { echo "::error::npm docs bundled"; exit 1; }
           if ls "$R"/mcp-server/*.test.mjs >/dev/null 2>&1; then echo "::error::tests bundled"; exit 1; fi
-          [ "$(lipo -archs "$R/../MacOS/ai-wp-builder")" = "$LIPO" ]
-          du -sh "$R/../.." "$R/../MacOS/ai-wp-builder" "$R/runtime/php" "$R/runtime/node"
+          [ "$(lipo -archs "$R/../MacOS/ShipPress")" = "$LIPO" ]
+          du -sh "$R/../.." "$R/../MacOS/ShipPress" "$R/runtime/php" "$R/runtime/node"
           if [ "$RUNS" != true ]; then echo "::warning::not running the $ARCH app's tools on this runner"; exit 0; fi
           # A clean Mac: no php or node on PATH (/usr/bin has neither). The bundled ones only, as the app passes them.
           if PATH=/usr/bin:/bin command -v node >/dev/null; then echo "::error::node on the clean PATH, the check below proves nothing"; exit 1; fi
